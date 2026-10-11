@@ -153,6 +153,44 @@ def reflow_breaks(chars, cls_of, skip=(), slack: float = 0.4) -> set:
 
 
 # --------------------------------------------------------------------------
+# 1b. Gộp ký tự "đệm" giữa hai glyph lỗi vào chung một khối công thức
+# --------------------------------------------------------------------------
+_FILLER_CHARS = set(" '\u2019\u2018\"\u201c\u201d-\u2013\u2014")
+
+
+def broken_glyph_merge_ids(chars, cls_of, vflag) -> set:
+    """Trả về id() các ký tự "đệm" (dấu cách, nháy, gạch nối...) nằm giữa hai
+    ký tự glyph lỗi (vflag() trả True — ví dụ ToUnicode CMap hỏng trả control
+    char, xem vflag()), trong cùng một khung layout.
+
+    Lý do cần hàm này: nếu không gộp, mỗi lần gặp một ký tự "đệm" giữa hai
+    glyph lỗi, converter sẽ đóng khối công thức đang dở và mở một placeholder
+    {vN} MỚI ngay sau đó. Một cụm chữ hoa nhỏ (small caps) bị vỡ glyph dài có
+    dấu cách/dấu nháy bên trong (ví dụ một câu trích dẫn) vì vậy bị cắt thành
+    HÀNG CHỤC placeholder {vN} rời rạc, tất cả đều bị nhét thẳng vào câu gửi
+    đi dịch máy. Càng nhiều placeholder rời rạc, xác suất bộ dịch làm hỏng cú
+    pháp của một trong số đó càng cao — và khi việc đó xảy ra, placeholder đó
+    không khớp lại được lúc dựng trang, nên hiện ra thành chữ thô "{vN}" trên
+    trang thay vì được thay bằng glyph gốc. Gộp các ký tự đệm vào chung một
+    khối giảm mạnh số lượng placeholder, giảm rủi ro này."""
+    n = len(chars)
+    out = set()
+    i = 0
+    while i < n:
+        if chars[i].get_text() in _FILLER_CHARS:
+            j = i
+            while j < n and chars[j].get_text() in _FILLER_CHARS:
+                j += 1
+            if i > 0 and j < n and cls_of(chars[i - 1]) == cls_of(chars[j]):
+                if vflag(chars[i - 1].fontname, chars[i - 1].get_text()) and vflag(chars[j].fontname, chars[j].get_text()):
+                    out.update(id(c) for c in chars[i:j])
+            i = j
+        else:
+            i += 1
+    return out
+
+
+# --------------------------------------------------------------------------
 # 2. Màu theo từng đoạn chữ
 # --------------------------------------------------------------------------
 def op_rgb(op):
@@ -473,7 +511,7 @@ def _style_of(ch) -> int:
 
 # Set the environment variable PDF2ZH_DIAG=1 to print one diagnostic line per page.
 _DIAG = bool(os.environ.get("PDF2ZH_DIAG"))
-_FIX_VERSION = "converter fix v8 single-file + bold/italic (per-run colours + would-fit/hanging-indent entry split + hanging indent + overlap guard)"
+_FIX_VERSION = "converter fix v9 single-file + bold/italic (per-run colours + would-fit/hanging-indent entry split + hanging indent + overlap guard + broken-glyph filler merge)"
 _banner_shown = False
 
 
@@ -740,6 +778,23 @@ class TranslateConverter(PDFConverterEx):
             font = font.split("+")[-1]      # 字体名截断
             if re.match(r"\(cid:", char):
                 return True
+            # ToUnicode CMap của font bị thiếu entry cho một số glyph (hay gặp ở
+            # biến thể chữ hoa nhỏ/small-caps hoặc ligature do font bị subset):
+            # to_unichr() không raise lỗi mà âm thầm trả về NUL ("\x00") hoặc các
+            # control char khác. Đã xác minh trên file thật (vd. font
+            # "ACaslonPro-Semibold" trong "The New Map"): các glyph rời rạc, có cid
+            # khác nhau (nên vẫn có hình glyph thật trong font), nhưng to_unichr
+            # đều ra "\x00". Nếu cứ để sstk nhận NUL rồi gửi đi dịch, ký tự bị mất
+            # (dịch máy/encode URL nuốt mất NUL) hoặc bị dịch+vẽ lại bằng Noto
+            # thành rác đọc được như "%00%00...". Nên coi các glyph này là công
+            # thức -> giữ nguyên, vẽ lại bằng đúng cid + font gốc (bỏ qua dịch),
+            # ra đúng hình chữ hoa nhỏ như bản gốc dù không dịch được.
+            if char and all((ord(c) < 0x20 or ord(c) == 0x7F) for c in char):
+                return True
+            # Một số font/công cụ sinh PDF khác lại dùng chuỗi giữ chỗ dạng văn
+            # bản "%00", "%1a"... thay vì NUL thật -> xử lý tương tự cho chắc.
+            if re.fullmatch(r"(?:%[0-9A-Fa-f]{2})+", char):
+                return True
             # 基于字体名规则的判定
             if self.vfont:
                 if re.match(self.vfont, font):
@@ -776,6 +831,8 @@ class TranslateConverter(PDFConverterEx):
 
         # Tách đoạn/mục theo luật would-fit + treo lề (mục lục tra cứu, danh mục tham khảo,
         # đoạn bị layout model gộp nhầm). hang_cls: các khung kiểu treo lề (dòng nối tiếp thụt vào).
+        # Đồng thời tính broken_merge_ids: các ký tự đệm (dấu cách/nháy/gạch nối) nằm giữa
+        # hai glyph lỗi, cần được gộp vào chung một khối công thức (xem broken_glyph_merge_ids()).
         try:
             _lay = self.layout[ltpage.pageid]
             _lh, _lw = _lay.shape
@@ -783,13 +840,16 @@ class TranslateConverter(PDFConverterEx):
             def _cls_of(c):
                 return _lay[np.clip(int(c.y0), 0, _lh - 1), np.clip(int(c.x0), 0, _lw - 1)]
 
+            _page_chars = [c for c in ltpage if isinstance(c, LTChar)]
             rf_breaks, hang_cls = (
-                reflow_plan([c for c in ltpage if isinstance(c, LTChar)], _cls_of)
+                reflow_plan(_page_chars, _cls_of)
                 if toc_split else (set(), set())
             )
+            broken_merge_ids = broken_glyph_merge_ids(_page_chars, _cls_of, vflag)
         except Exception as e:
-            log.warning(f"reflow_plan failed on page {ltpage.pageid + 1}: {e!r}")
+            log.warning(f"reflow_plan/broken_glyph_merge_ids failed on page {ltpage.pageid + 1}: {e!r}")
             rf_breaks, hang_cls = set(), set()
+            broken_merge_ids = set()
 
         ############################################################
         # A. 原文档解析
@@ -811,6 +871,7 @@ class TranslateConverter(PDFConverterEx):
                     or (cls == xt_cls and len(sstk[-1].strip()) > 1 and child.size < pstk[-1].size * 0.79)  # 2. 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
                     or vflag(child.fontname, child.get_text())                                              # 3. 公式字体
                     or (child.matrix[0] == 0 and child.matrix[3] == 0)                                      # 4. 垂直字体
+                    or _obj_id(child) in broken_merge_ids                                                    # 5. dấu cách/nháy/gạch nối nằm giữa hai glyph lỗi (gộp lại, xem broken_glyph_merge_ids())
                 ):
                     cur_v = True
                 # 判定括号组是否属于公式
@@ -988,13 +1049,26 @@ class TranslateConverter(PDFConverterEx):
         # B. 段落翻译
         log.debug("\n==========[SSTACK]==========\n")
 
+        # Dọn placeholder "%00"/"%1a"... (ToUnicode CMap hỏng, xem vflag()) và các
+        # ký tự điều khiển (NUL...) có thể lẫn trong văn bản gốc trước khi gửi đi
+        # dịch/cache: nếu lọt qua, chúng có thể bị URL-encode (vd. NUL -> "%00")
+        # hoặc dịch máy trả về nguyên văn, khiến bản dịch hiện rác trên trang.
+        _CID_PLACEHOLDER_RE = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+        _CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+        def _sanitize(s: str) -> str:
+            s = _CID_PLACEHOLDER_RE.sub("", s)
+            s = _CTRL_CHAR_RE.sub("", s)
+            return s
+
         @retry(wait=wait_fixed(1))
         def worker(s: str):  # 多线程翻译
+            s = _sanitize(s)
             if not s.strip() or re.match(r"^\{v\d+\}$", s) or re.fullmatch(r"[\d\s.,:;()\-–]+", s):  # 空白、公式、纯数字不翻译
                 return s
             try:
                 new = self.translator.translate(s)
-                return new
+                return _sanitize(new)
             except BaseException as e:
                 if log.isEnabledFor(logging.DEBUG):
                     log.exception(e)
@@ -1292,6 +1366,7 @@ class TranslateConverter(PDFConverterEx):
             _cols = Counter(fin_cols)
             print(f"[pdf2zh-fix] page {ltpage.pageid + 1}: paragraphs={len(news)} toc_entries={len(toc_ent)} "
                   f"list_boxes={len(list_cls)} reflow_breaks={len(rf_breaks)} hanging_boxes={len(hang_cls)} "
+                  f"broken_merge_fillers={len(broken_merge_ids)} "
                   f"colour_runs={n_runs} colour_from_pixels={n_sampled[0]} colours={dict(_cols)}")
         ops = f"q BT {''.join(ops_list)}ET Q "
         return ops
@@ -1300,3 +1375,4 @@ class TranslateConverter(PDFConverterEx):
 class OpType(Enum):
     TEXT = "text"
     LINE = "line"
+    

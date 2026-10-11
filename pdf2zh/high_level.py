@@ -124,6 +124,7 @@ def translate_patch(
     envs: Dict = None,
     prompt: Template = None,
     ignore_cache: bool = False,
+    ocr_pages: Optional[set] = None,
     **kwarg: Any,
 ) -> None:
     rsrcmgr = PDFResourceManager()
@@ -169,6 +170,20 @@ def translate_patch(
                 pix.height, pix.width, 3
             )[:, :, ::-1]
             page_layout = model.predict(image, imgsz=int(pix.height / 32) * 32)[0]
+            if ocr_pages and pageno in ocr_pages:
+                # image-only page that got an OCR text layer: translate it with
+                # pdf2zh/ocr.py and skip the normal pdfminer path for this page
+                from pdf2zh.ocr import translate_ocr_page
+
+                translate_ocr_page(
+                    doc_zh[pageno],
+                    page_layout,
+                    device.translator,
+                    noto,
+                    thread,
+                    cancellation_event,
+                )
+                continue
             # kdtree 是不可能 kdtree 的，不如直接渲染成图片，用空间换时间
             box = np.ones((pix.height, pix.width))
             h, w = box.shape
@@ -203,6 +218,112 @@ def translate_patch(
 
     device.close()
     return obj_patch
+
+
+# ---------------------------------------------------------------------------
+# OCR for image-only pages (ported from upstream pdf2zh main, see pdf2zh/ocr.py)
+# ---------------------------------------------------------------------------
+# pdf2zh language code -> Tesseract code. Env var PDF2ZH_OCR_LANGUAGE (for
+# example "vie" or "eng+vie") overrides this. Anything not listed is passed
+# to Tesseract unchanged.
+_OCR_LANG_MAP = {
+    "en": "eng",
+    "zh": "chi_sim",
+    "zh-cn": "chi_sim",
+    "zh-tw": "chi_tra",
+    "ja": "jpn",
+    "ko": "kor",
+    "de": "deu",
+    "fr": "fra",
+    "es": "spa",
+    "it": "ita",
+    "pt": "por",
+    "ru": "rus",
+    "vi": "vie",  # not in upstream: Tesseract uses "vie", not "vi"
+}
+
+
+def _ocr_tessdata(language):
+    """Use TESSDATA_PREFIX if set, otherwise download the language data once."""
+    if not re.fullmatch(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*", language):
+        raise ValueError("Invalid OCR language; use Tesseract codes such as eng+vie")
+    if tessdata := os.environ.get("TESSDATA_PREFIX"):
+        return tessdata
+    try:
+        import pooch
+    except ImportError as exc:
+        raise RuntimeError(
+            "OCR needs language data. Either set TESSDATA_PREFIX to a folder "
+            "containing <lang>.traineddata (e.g. eng.traineddata), or install pooch."
+        ) from exc
+    cache = Path.home() / ".cache/pdf2zh/tessdata/4.1.0"
+    for code in dict.fromkeys(language.split("+")):
+        filename = f"{code}.traineddata"
+        try:
+            pooch.retrieve(
+                url=f"https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/{filename}",
+                known_hash=None,
+                fname=filename,
+                path=cache,
+                downloader=pooch.HTTPDownloader(timeout=60),
+            )
+        except (requests.RequestException, OSError) as exc:
+            raise RuntimeError(
+                f"Could not download OCR data for '{code}'. Check the language code "
+                "and network connection, or set TESSDATA_PREFIX to local data."
+            ) from exc
+    return str(cache)
+
+
+def _ocr_pages(doc, pages, lang_in, cancellation_event):
+    """Add an invisible text layer to image-only pages of the working copy.
+
+    Returns the set of page numbers that were OCR'd. Pages that already have
+    text, or that have no image, are left alone.
+    """
+    language = os.environ.get("PDF2ZH_OCR_LANGUAGE") or _OCR_LANG_MAP.get(
+        (lang_in or "").lower(), lang_in or "eng"
+    )
+    ocr_pages = set()
+    tessdata = None
+    for pageno in range(len(doc)):
+        if cancellation_event and cancellation_event.is_set():
+            raise CancelledError("task cancelled")
+        if pages and pageno not in pages:
+            continue
+        page = doc[pageno]
+        if page.get_text().strip() or not page.get_image_info():
+            continue
+        logger.info("OCR page %d (%s)", pageno + 1, language)
+        if tessdata is None:
+            tessdata = _ocr_tessdata(language)
+        try:
+            data = page.get_pixmap(dpi=300, alpha=False, annots=False).pdfocr_tobytes(
+                language=language,
+                tessdata=tessdata,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"OCR failed on page {pageno + 1} using '{language}' data in {tessdata}. "
+                "Check the language data and any TESSDATA_PREFIX override. "
+                "Use PDF2ZH_OCR_LANGUAGE to override the OCR language."
+            ) from exc
+        with Document(stream=data) as recognized:
+            if not recognized[0].get_text().strip():
+                logger.warning("OCR found no text on page %d", pageno + 1)
+                continue
+            contents = doc.get_new_xref()
+            doc.update_object(contents, "<<>>")
+            doc.update_stream(contents, b"")
+            page.set_contents(contents)
+            page.show_pdf_page(
+                page.rect * page.derotation_matrix,
+                recognized,
+                0,
+                rotate=page.rotation,
+            )
+        ocr_pages.add(pageno)
+    return ocr_pages
 
 
 def translate_stream(
@@ -247,6 +368,7 @@ def translate_stream(
     stream = io.BytesIO()
     doc_en.save(stream)
     doc_zh = Document(stream=stream)
+    ocr_pages = _ocr_pages(doc_zh, pages, lang_in, cancellation_event)
     page_count = doc_zh.page_count
     # font_list = [("GoNotoKurrent-Regular.ttf", font_path), ("tiro", None)]
     font_id = {}
