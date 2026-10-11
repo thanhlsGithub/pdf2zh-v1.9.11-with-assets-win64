@@ -27,6 +27,7 @@ from pdf2zh.doclayout import OnnxModel
 from pdf2zh.pdfinterp import PDFPageInterpreterEx
 
 from pdf2zh.config import ConfigManager
+from pdf2zh.logsetup import set_progress, stage, fmt_pages
 from babeldoc.assets.assets import get_font_and_metadata
 
 NOTO_NAME = "noto"
@@ -165,6 +166,7 @@ def translate_patch(
             if callback:
                 callback(progress)
             page.pageno = pageno
+            set_progress(f"translate page {pageno + 1}/{doc_zh.page_count}")  # chỉ giữ trang mới nhất, không log từng trang
             pix = doc_zh[page.pageno].get_pixmap()
             image = np.frombuffer(pix.samples, np.uint8).reshape(
                 pix.height, pix.width, 3
@@ -172,8 +174,8 @@ def translate_patch(
             page_layout = model.predict(image, imgsz=int(pix.height / 32) * 32)[0]
             if ocr_pages and pageno in ocr_pages:
                 # image-only page that got an OCR text layer: translate it with
-                # pdf2zh/ocr.py and skip the normal pdfminer path for this page
-                from pdf2zh.ocr import translate_ocr_page
+                # pdf2zh/ocr_prep.py (legacy mode) and skip the normal pdfminer path for this page
+                from pdf2zh.ocr_prep import translate_ocr_page
 
                 translate_ocr_page(
                     doc_zh[pageno],
@@ -285,6 +287,7 @@ def _ocr_pages(doc, pages, lang_in, cancellation_event):
         (lang_in or "").lower(), lang_in or "eng"
     )
     ocr_pages = set()
+    empty = []
     tessdata = None
     for pageno in range(len(doc)):
         if cancellation_event and cancellation_event.is_set():
@@ -294,7 +297,7 @@ def _ocr_pages(doc, pages, lang_in, cancellation_event):
         page = doc[pageno]
         if page.get_text().strip() or not page.get_image_info():
             continue
-        logger.info("OCR page %d (%s)", pageno + 1, language)
+        set_progress(f"OCR page {pageno + 1}/{len(doc)}")
         if tessdata is None:
             tessdata = _ocr_tessdata(language)
         try:
@@ -310,7 +313,7 @@ def _ocr_pages(doc, pages, lang_in, cancellation_event):
             ) from exc
         with Document(stream=data) as recognized:
             if not recognized[0].get_text().strip():
-                logger.warning("OCR found no text on page %d", pageno + 1)
+                empty.append(pageno)
                 continue
             contents = doc.get_new_xref()
             doc.update_object(contents, "<<>>")
@@ -323,7 +326,33 @@ def _ocr_pages(doc, pages, lang_in, cancellation_event):
                 rotate=page.rotation,
             )
         ocr_pages.add(pageno)
+    if empty:
+        logger.warning("OCR found no text on %s", fmt_pages(empty))
     return ocr_pages
+
+
+def _prepare_ocr(doc, pages, lang_in, cancellation_event, model=None):
+    """Chon cach xu ly trang thieu chu (scan / anh / duong cong / trang hon hop).
+
+    PDF2ZH_OCR_MODE=region (mac dinh): pdf2zh/ocr_prep.py, OCR theo VUNG tren moi trang,
+        ve lai thanh chu that, trang di tiep pipeline co dien nhu PDF thuong.
+    PDF2ZH_OCR_MODE=legacy: cach cu (_ocr_pages + ocr.py), chi OCR trang khong co chu nao.
+    """
+    if os.environ.get("PDF2ZH_OCR_MODE", "region").strip().lower() == "legacy":
+        return _ocr_pages(doc, pages, lang_in, cancellation_event)
+    from pdf2zh.ocr_prep import prep_document
+
+    language = os.environ.get("PDF2ZH_OCR_LANGUAGE") or _OCR_LANG_MAP.get(
+        (lang_in or "").lower(), lang_in or "eng"
+    )
+    return prep_document(
+        doc,
+        pages,
+        language,
+        lambda: _ocr_tessdata(language),
+        cancellation_event,
+        model,
+    )
 
 
 def translate_stream(
@@ -368,7 +397,13 @@ def translate_stream(
     stream = io.BytesIO()
     doc_en.save(stream)
     doc_zh = Document(stream=stream)
-    ocr_pages = _ocr_pages(doc_zh, pages, lang_in, cancellation_event)
+    logger.info(
+        "translate_stream: %d bytes, pages=%s, %s -> %s, service=%s, thread=%s, format=%s",
+        stream.getbuffer().nbytes if hasattr(stream, "getbuffer") else -1,
+        fmt_pages(pages), lang_in, lang_out, service, thread, output_format,
+    )
+    with stage("OCR prep"):
+        ocr_pages = _prepare_ocr(doc_zh, pages, lang_in, cancellation_event, model)
     page_count = doc_zh.page_count
     # font_list = [("GoNotoKurrent-Regular.ttf", font_path), ("tiro", None)]
     font_id = {}
@@ -403,7 +438,8 @@ def translate_stream(
     fp = io.BytesIO()
 
     doc_zh.save(fp)
-    obj_patch: dict = translate_patch(fp, **locals())
+    with stage("translate pages"):
+        obj_patch: dict = translate_patch(fp, **locals())
 
     for obj_id, ops_new in obj_patch.items():
         # ops_old=doc_en.xref_stream(obj_id)

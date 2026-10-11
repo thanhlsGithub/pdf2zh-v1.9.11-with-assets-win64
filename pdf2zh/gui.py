@@ -1,5 +1,6 @@
 import asyncio
 import cgi
+import functools
 import inspect
 import multiprocessing as mp
 import os
@@ -7,6 +8,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -25,6 +27,7 @@ from pdf2zh import __version__
 from pdf2zh.high_level import translate, get_output_paths
 from pdf2zh.doclayout import ModelInstance
 from pdf2zh.config import ConfigManager
+from pdf2zh.logsetup import setup_logging, report_exception, log_hint, get_crash_path, fmt_pages
 from pdf2zh.translator import (
     AnythingLLMTranslator,
     AzureOpenAITranslator,
@@ -57,7 +60,33 @@ from pdf2zh.translator import (
 from babeldoc.docvision.doclayout import OnnxModel
 from babeldoc import __version__ as babeldoc_version
 
+setup_logging("gui")  # log ra file; tiến trình dịch con import lại module này nên cũng tự cài
 logger = logging.getLogger(__name__)
+
+
+def _sweep_old_gradio_cache(max_age: float = 86400.0) -> None:
+    """Gradio chép mỗi file tải lên vào %TEMP%/gradio và không dọn khi tắt app (mỗi sách vài chục MB).
+    Mở app là xoá các mục cũ hơn `max_age` giây. Chỉ tiến trình chính; bỏ qua nếu GRADIO_TEMP_DIR
+    được đặt riêng (thư mục đó do người dùng quản lý)."""
+    if mp.current_process().name != "MainProcess" or os.environ.get("GRADIO_TEMP_DIR"):
+        return
+    root = Path(tempfile.gettempdir()) / "gradio"
+    now, removed = time.time(), 0
+    try:
+        for entry in root.iterdir():
+            try:
+                if now - entry.stat().st_mtime > max_age:
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:
+        return
+    if removed:
+        logger.info("removed %d old Gradio cache entries from %s", removed, root)
+
+
+_sweep_old_gradio_cache()
 
 _BABELDOC_MODEL = None
 
@@ -450,6 +479,13 @@ def _wait_previous_job(state: dict) -> None:
 def _translation_worker(use_babeldoc, param, stop_evt, msg_q) -> None:
     """Runs in a separate process (or a thread): does the actual translation."""
     try:
+        setup_logging("worker")
+        logger.info(
+            "worker start: babeldoc=%s files=%s pages=%s %s->%s service=%s thread=%s format=%s",
+            use_babeldoc, param.get("files"), fmt_pages(param.get("pages")),
+            param.get("lang_in"), param.get("lang_out"), param.get("service"),
+            param.get("thread"), param.get("output_format"),
+        )
         from pdf2zh import doclayout as _dl
         from pdf2zh import translator as _tr
 
@@ -488,9 +524,11 @@ def _translation_worker(use_babeldoc, param, stop_evt, msg_q) -> None:
             translate(**param)
             msg_q.put(("done", None))
     except CancelledError:
+        logger.info("worker: translation cancelled")
         msg_q.put(("cancelled", None))
     except BaseException as e:  # noqa: BLE001 - report everything to the parent
-        msg_q.put(("error", f"{type(e).__name__}: {e}"))
+        # traceback đầy đủ vào pdf2zh_logs/pdf2zh.log; GUI nhận bản tóm tắt + đường dẫn log
+        msg_q.put(("error", report_exception("translation worker", e)))
 
 
 def _can_spawn_process() -> bool:
@@ -603,10 +641,14 @@ def run_translation_job(session_id, use_babeldoc, param, progress):
         )
     if result is not None and result[0] == "error":
         raise gr.Error(result[1])
-    raise gr.Error(
+    crash = get_crash_path()
+    msg = (
         "Translation process ended unexpectedly "
-        f"(exit code {getattr(proc, 'exitcode', None)})"
+        f"(exit code {getattr(proc, 'exitcode', None)}). "
+        f"{log_hint()}" + (f"\nCrash dump: {crash}" if crash else "")
     )
+    logger.error(msg)
+    raise gr.Error(msg)
 
 
 def get_page_count(pdf_path) -> T.Optional[int]:
@@ -642,6 +684,43 @@ def build_outputs(file_mono, file_dual, output_format: str = "mono"):
     )
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _discard_input(path) -> None:
+    """Xoá bản sao file gốc trong pdf2zh_files sau khi dịch (đã có file gốc của bạn + bản dịch)."""
+    if path is None:
+        return
+    try:
+        Path(path).unlink()
+        logger.debug("removed input copy %s", path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:  # đang bị khoá: để lại, lần sau tự dọn không cần thiết
+        logger.debug("could not remove input copy %s: %s", path, e)
+
+
+def _logged(fn):
+    """Gradio chỉ hiện chữ "Error" cho exception thường. Bọc lại: ghi traceback vào log và
+    đổi thành gr.Error có nội dung + đường dẫn log."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except gr.Error as e:
+            logger.warning("%s -> %s", fn.__name__, e)
+            raise
+        except CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise gr.Error(report_exception(fn.__name__, e)) from e
+
+    return wrapper
+
+
+@_logged
 def translate_file(
     file_type,
     file_input,
@@ -707,6 +786,7 @@ def translate_file(
 
     output = Path("pdf2zh_files")
     output.mkdir(parents=True, exist_ok=True)
+    before = set(os.listdir(output))  # để biết bản sao đầu vào nào do chính lần dịch này tạo ra
 
     if file_type == "File":
         if not file_input:
@@ -723,101 +803,104 @@ def translate_file(
 
     filename = os.path.splitext(os.path.basename(file_path))[0]
     file_raw = output / f"{filename}.pdf"
-
-    if output_format not in ("mono", "dual", "both"):
-        output_format = "mono"
-
-    translator = service_map[service]
-    if page_range == "First N pages":
-        try:
-            n_pages = int(str(page_input).strip())
-            if n_pages < 1:
-                raise ValueError
-        except ValueError:
-            raise gr.Error("Please enter a valid number of pages (e.g. 20)")
-        selected_page = list(range(0, n_pages))
-    elif page_range == "Page range":
-        try:
-            p_from = int(str(page_from).strip())
-            p_to = int(str(page_to).strip())
-        except ValueError:
-            raise gr.Error(
-                "Please enter both 'From page' and 'To page' (e.g. 50 and 100)"
-            )
-        if p_from < 1 or p_to < p_from:
-            raise gr.Error(
-                "Invalid page range: 'From page' must be at least 1 and not greater than 'To page'"
-            )
-        total_pages = get_page_count(file_raw)
-        if total_pages is not None:
-            if p_from > total_pages:
-                raise gr.Error(f"The document only has {total_pages} pages")
-            p_to = min(p_to, total_pages)  # 'To page' beyond the end -> last page
-        selected_page = list(range(p_from - 1, p_to))
-    else:
-        selected_page = page_map[page_range]
-    lang_from = lang_map[lang_from]
-    lang_to = lang_map[lang_to]
-    # e.g. <name>-VI.pdf (mono) and <name>-EN-VI.pdf (dual)
-    file_mono, file_dual = get_output_paths(output, filename, lang_from, lang_to)
-    need_mono = output_format in ("mono", "both")
-    need_dual = output_format in ("dual", "both")
-
-    _envs = {}
-    for i, env in enumerate(translator.envs.items()):
-        _envs[env[0]] = envs[i]
-    for k, v in _envs.items():
-        if str(k).upper().endswith("API_KEY") and str(v) == "***":
-            # Load Real API_KEYs from local configure file
-            real_keys: str = ConfigManager.get_env_by_translatername(
-                translator, k, None
-            )
-            _envs[k] = real_keys
-
-    print(f"Files before translation: {os.listdir(output)}")
+    # Bản sao đầu vào chỉ là phần thừa khi dịch xong. Chỉ xoá nếu nó do lần này tạo ra (file đã có sẵn
+    # trong pdf2zh_files từ trước thì không đụng tới). Đặt PDF2ZH_KEEP_INPUT=1 để giữ lại.
+    discard = None if (file_raw.name in before or _env_flag("PDF2ZH_KEEP_INPUT")) else file_raw
 
     try:
-        threads = int(threads)
-    except ValueError:
-        threads = 1
+        if output_format not in ("mono", "dual", "both"):
+            output_format = "mono"
 
-    param = {
-        "files": [str(file_raw)],
-        "pages": selected_page,
-        "lang_in": lang_from,
-        "lang_out": lang_to,
-        "service": f"{translator.name}",
-        "output": output,
-        "thread": int(threads),
-        "envs": _envs,
-        "prompt": Template(prompt) if prompt else None,
-        "skip_subset_fonts": skip_subset_fonts,
-        "ignore_cache": ignore_cache,
-        "vfont": vfont,  # 添加自定义公式字体正则表达式
-        "output_format": output_format,
-    }
+        translator = service_map[service]
+        if page_range == "First N pages":
+            try:
+                n_pages = int(str(page_input).strip())
+                if n_pages < 1:
+                    raise ValueError
+            except ValueError:
+                raise gr.Error("Please enter a valid number of pages (e.g. 20)")
+            selected_page = list(range(0, n_pages))
+        elif page_range == "Page range":
+            try:
+                p_from = int(str(page_from).strip())
+                p_to = int(str(page_to).strip())
+            except ValueError:
+                raise gr.Error(
+                    "Please enter both 'From page' and 'To page' (e.g. 50 and 100)"
+                )
+            if p_from < 1 or p_to < p_from:
+                raise gr.Error(
+                    "Invalid page range: 'From page' must be at least 1 and not greater than 'To page'"
+                )
+            total_pages = get_page_count(file_raw)
+            if total_pages is not None:
+                if p_from > total_pages:
+                    raise gr.Error(f"The document only has {total_pages} pages")
+                p_to = min(p_to, total_pages)  # 'To page' beyond the end -> last page
+            selected_page = list(range(p_from - 1, p_to))
+        else:
+            selected_page = page_map[page_range]
+        lang_from = lang_map[lang_from]
+        lang_to = lang_map[lang_to]
+        # e.g. <name>-VI.pdf (mono) and <name>-EN-VI.pdf (dual)
+        file_mono, file_dual = get_output_paths(output, filename, lang_from, lang_to)
+        need_mono = output_format in ("mono", "both")
+        need_dual = output_format in ("dual", "both")
 
-    # Runs in a separate process or thread (callback / cancellation event /
-    # model are added inside the worker). Raises gr.Error when stopped/killed.
-    result = run_translation_job(session_id, use_babeldoc, param, progress)
-    state["paused"] = False  # finished normally (even if Stop was clicked too late)
-    if use_babeldoc:
+        _envs = {}
+        for i, env in enumerate(translator.envs.items()):
+            _envs[env[0]] = envs[i]
+        for k, v in _envs.items():
+            if str(k).upper().endswith("API_KEY") and str(v) == "***":
+                # Load Real API_KEYs from local configure file
+                real_keys: str = ConfigManager.get_env_by_translatername(
+                    translator, k, None
+                )
+                _envs[k] = real_keys
+
+        try:
+            threads = int(threads)
+        except ValueError:
+            threads = 1
+
+        param = {
+            "files": [str(file_raw)],
+            "pages": selected_page,
+            "lang_in": lang_from,
+            "lang_out": lang_to,
+            "service": f"{translator.name}",
+            "output": output,
+            "thread": int(threads),
+            "envs": _envs,
+            "prompt": Template(prompt) if prompt else None,
+            "skip_subset_fonts": skip_subset_fonts,
+            "ignore_cache": ignore_cache,
+            "vfont": vfont,  # 添加自定义公式字体正则表达式
+            "output_format": output_format,
+        }
+
+        # Runs in a separate process or thread (callback / cancellation event /
+        # model are added inside the worker). Raises gr.Error when stopped/killed.
+        result = run_translation_job(session_id, use_babeldoc, param, progress)
+        state["paused"] = False  # finished normally (even if Stop was clicked too late)
+        if use_babeldoc:
+            progress(1.0, desc="Translation complete!")
+            return build_outputs(result[0], result[1], output_format)
+
+        if (need_mono and not file_mono.exists()) or (
+            need_dual and not file_dual.exists()
+        ):
+            raise gr.Error("No output")
+
         progress(1.0, desc="Translation complete!")
-        return build_outputs(result[0], result[1], output_format)
-    print(f"Files after translation: {os.listdir(output)}")
 
-    if (need_mono and not file_mono.exists()) or (
-        need_dual and not file_dual.exists()
-    ):
-        raise gr.Error("No output")
-
-    progress(1.0, desc="Translation complete!")
-
-    return build_outputs(
-        file_mono if need_mono else None,
-        file_dual if need_dual else None,
-        output_format,
-    )
+        return build_outputs(
+            file_mono if need_mono else None,
+            file_dual if need_dual else None,
+            output_format,
+        )
+    finally:
+        _discard_input(discard)
 
 
 _toggle_lock = threading.Lock()
@@ -1274,6 +1357,11 @@ tech_details_string = f"""
                 """
 
 
+# Gradio tự xoá các file tải lên cũ hơn 1 ngày (kiểm tra mỗi giờ) nếu bản Gradio hỗ trợ
+_blocks_extra = {}
+if "delete_cache" in inspect.signature(gr.Blocks.__init__).parameters:
+    _blocks_extra["delete_cache"] = (3600, 86400)
+
 # The following code creates the GUI
 with gr.Blocks(
     title="PDFMathTranslate - PDF Translation with preserved formats",
@@ -1282,6 +1370,7 @@ with gr.Blocks(
     ),
     css=custom_css,
     head=demo_recaptcha if flag_demo else "",
+    **_blocks_extra,
 ) as demo:
     gr.Markdown(
         "# [PDFMathTranslate @ GitHub](https://github.com/Byaidu/PDFMathTranslate)"
@@ -1639,7 +1728,7 @@ def setup_gui(
             try:
                 demo.launch(
                     server_name="0.0.0.0",
-                    debug=True,
+                    debug=True, show_error=True,
                     inbrowser=True,
                     share=share,
                     server_port=server_port,
@@ -1651,7 +1740,7 @@ def setup_gui(
                 try:
                     demo.launch(
                         server_name="127.0.0.1",
-                        debug=True,
+                        debug=True, show_error=True,
                         inbrowser=True,
                         share=share,
                         server_port=server_port,
@@ -1661,13 +1750,13 @@ def setup_gui(
                         "Error launching GUI using 127.0.0.1.\nThis may be caused by global mode of proxy software."
                     )
                     demo.launch(
-                        debug=True, inbrowser=True, share=True, server_port=server_port
+                        debug=True, show_error=True, inbrowser=True, share=True, server_port=server_port
                     )
         else:
             try:
                 demo.launch(
                     server_name="0.0.0.0",
-                    debug=True,
+                    debug=True, show_error=True,
                     inbrowser=True,
                     share=share,
                     auth=user_list,
@@ -1681,7 +1770,7 @@ def setup_gui(
                 try:
                     demo.launch(
                         server_name="127.0.0.1",
-                        debug=True,
+                        debug=True, show_error=True,
                         inbrowser=True,
                         share=share,
                         auth=user_list,
@@ -1693,7 +1782,7 @@ def setup_gui(
                         "Error launching GUI using 127.0.0.1.\nThis may be caused by global mode of proxy software."
                     )
                     demo.launch(
-                        debug=True,
+                        debug=True, show_error=True,
                         inbrowser=True,
                         share=True,
                         auth=user_list,

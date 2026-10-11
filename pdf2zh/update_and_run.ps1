@@ -52,11 +52,22 @@ foreach ($f in $files) {
 }
 if ($n -eq 0) { Write-Host "Không có file nào thay đổi." -ForegroundColor Yellow }
 
+# 3b. Xóa file đã bị gộp/loại bỏ khỏi bản nguồn (ocr.py đã gộp vào ocr_prep.py) để không tồn đọng trong site-packages
+$obsolete = @("ocr.py")
+foreach ($name in $obsolete) {
+    if (Test-Path (Join-Path $src $name)) { continue }       # nguồn còn file đó -> giữ nguyên
+    foreach ($p in @((Join-Path $dst $name), (Join-Path $dst "$name.bak"))) {
+        if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue; Write-Host "  xóa file thừa $([IO.Path]::GetFileName($p))" -ForegroundColor Green }
+    }
+}
+
 # 4. Kiểm tra dấu hiệu của bản sửa (thiếu = file nguồn chưa phải bản mới)
 $markers = [ordered]@{
     "gui.py"        = "_can_spawn_process"
     "translator.py" = "set_cancel_event"
     "cache.py"      = "BUSY_TIMEOUT_MS"
+    "logsetup.py"   = "def set_progress"
+    "ocr_prep.py"   = "def translate_ocr_page"
 }
 foreach ($name in $markers.Keys) {
     $p = Join-Path $dst $name

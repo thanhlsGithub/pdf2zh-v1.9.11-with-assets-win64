@@ -247,6 +247,9 @@ def main(args: Optional[List[str]] = None) -> int:
     from rich.logging import RichHandler
 
     logging.basicConfig(level=logging.INFO, handlers=[RichHandler()])
+    from pdf2zh.logsetup import setup_logging
+
+    setup_logging("main")  # log ra file pdf2zh_logs/pdf2zh.log
 
     # disable httpx, openai, httpcore, http11 logs
     logging.getLogger("httpx").setLevel("CRITICAL")
