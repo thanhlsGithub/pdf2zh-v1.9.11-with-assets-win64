@@ -694,11 +694,11 @@ def _discard_input(path) -> None:
         return
     try:
         Path(path).unlink()
-        logger.debug("removed input copy %s", path)
+        logger.info("removed input copy %s", path)
     except FileNotFoundError:
         pass
     except OSError as e:  # đang bị khoá: để lại, lần sau tự dọn không cần thiết
-        logger.debug("could not remove input copy %s: %s", path, e)
+        logger.warning("could not remove input copy %s: %s", path, e)
 
 
 def _logged(fn):
@@ -805,7 +805,7 @@ def translate_file(
     file_raw = output / f"{filename}.pdf"
     # Bản sao đầu vào chỉ là phần thừa khi dịch xong. Chỉ xoá nếu nó do lần này tạo ra (file đã có sẵn
     # trong pdf2zh_files từ trước thì không đụng tới). Đặt PDF2ZH_KEEP_INPUT=1 để giữ lại.
-    discard = None if (file_raw.name in before or _env_flag("PDF2ZH_KEEP_INPUT")) else file_raw
+    discard = None if _env_flag("PDF2ZH_KEEP_INPUT") else file_raw
 
     try:
         if output_format not in ("mono", "dual", "both"):
